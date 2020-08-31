@@ -21,10 +21,12 @@ from blazarnova.i18n import _
 from nova.scheduler import filters
 from oslo_config import cfg
 from oslo_log import log as logging
+from oslo_utils.strutils import bool_from_string
 
 LOG = logging.getLogger(__name__)
 
 FLAVOR_EXTRA_SPEC = "aggregate_instance_extra_specs:reservation"
+FLAVOR_PREEMPTIBLE = "blazar:preemptible"
 
 opts = [
     cfg.StrOpt('aggregate_freepool_name',
@@ -39,7 +41,11 @@ opts = [
                help='Aggregate metadata key for knowing owner project_id'),
     cfg.StrOpt('blazar_az_prefix',
                default='blazar_',
-               help='Prefix for Availability Zones created by Blazar')
+               help='Prefix for Availability Zones created by Blazar'),
+    cfg.BoolOpt('allow_preemptibles',
+                default=False,
+                help='Whether to allow preemptible instances to be scheduled '
+                     'on freepool hosts')
 ]
 
 cfg.CONF.register_opts(opts, 'blazar:physical:host')
@@ -123,8 +129,9 @@ class BlazarFilter(filters.BaseHostFilter):
             return self.host_reservation_request(host_state, spec_obj,
                                                  requested_pools)
 
+        extra_specs = spec_obj.flavor.extra_specs
         # the request is instance reservation
-        if FLAVOR_EXTRA_SPEC in spec_obj.flavor.extra_specs.keys():
+        if FLAVOR_EXTRA_SPEC in extra_specs.keys():
             # Scheduling requests for instance reservation are processed by
             # other Nova filters: AggregateInstanceExtraSpecsFilter,
             # AggregateMultiTenancyIsolation, and
@@ -133,9 +140,22 @@ class BlazarFilter(filters.BaseHostFilter):
             # reservation key.
             return True
 
-        if self.fetch_blazar_pools(host_state):
+        allow_preempt = cfg.CONF['blazar:physical:host'].allow_preemptibles
+        preemptible = bool_from_string(
+            extra_specs.get(FLAVOR_PREEMPTIBLE, False))
+        blazar_pools = self.fetch_blazar_pools(host_state)
+        # If the request is for a preemptible instance and they are allowed
+        if allow_preempt and preemptible:
+            if (len(blazar_pools) == 1 and blazar_pools[0].name ==
+                    cfg.CONF['blazar:physical:host'].aggregate_freepool_name):
+                # Pass host if it only belongs to the freepool
+                LOG.info("Host %s requested for preemptibles" % host_state)
+                return True
+            return False
+
+        if blazar_pools:
             # Host is in a blazar pool and non reservation request
-            LOG.info(_("In a user pool or in the freepool"))
+            LOG.info("Host is in a reservation aggregate or in the freepool")
             return False
 
         return True
